@@ -230,7 +230,7 @@
 - [ ] STORY 15.2: 기존 문의 옮기기 — 브리핑·디스코드 전송 없이 (완료 확인: 기존 문의 수와 고객 탭 행 수가 같고 디스코드에 옛 문의 알림이 오지 않는다)
 - [ ] STORY 15.3: 운영자 링크·스태프 링크 배포 (완료 확인: 운영자 링크는 준성 계정에서만 열리고, 스태프 링크는 로그인 없이 폰에서 당일 체크가 열린다)
 - [x] STORY 15.4: GitHub 원격 저장소 연결 (완료 확인: GitHub 저장소 페이지에 코드가 보이고 스크립트 속성 값(키)은 들어 있지 않다)
-  - 기록: 프로젝트 전체(design·docs·rooted-admin)를 D:ooted로 옮겨 https://github.com/rooted12ourim-cpu/test 에 push. 커밋 전 비밀값 검사(Gemini 키·웹후크·토큰·디스코드 ID) 이상 없음. 노트북 C 드라이브 공간 부족으로 이후 작업 폴더는 D:ooted
+  - 기록: 프로젝트 전체(design·docs·rooted-admin)를 D:\rooted로 옮겨 https://github.com/rooted12ourim-cpu/test 에 push. 커밋 전 비밀값 검사(Gemini 키·웹후크·토큰·디스코드 ID) 이상 없음. 노트북 C 드라이브 공간 부족으로 이후 작업 폴더는 D:\rooted
 
 ---
 
