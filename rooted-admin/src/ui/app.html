@@ -1,0 +1,640 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <base target="_top">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css">
+  <?!= include('ui/styles') ?>
+  <script>const BOOT = <?!= boot ?>;</script>
+  <?!= include('ui/script') ?>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
+</head>
+<body>
+<div class="shell" x-data="app()" x-cloak>
+
+  <!-- 데스크톱 사이드바 -->
+  <aside class="sidebar" x-show="boot.role === 'operator'">
+    <div class="brand">rooted</div>
+    <button class="nav-item" :class="route.name === 'board' && 'on'" @click="go('board')">운영 보드</button>
+    <button class="nav-item" :class="(route.name === 'customers' || route.name === 'customer') && 'on'" @click="go('customers')">고객</button>
+    <button class="nav-item" :class="route.name === 'alerts' && 'on'" @click="go('alerts')">알림함 <span class="count" x-show="unread" x-text="unread"></span></button>
+    <div class="me small sub">
+      <div x-text="boot.name"></div>
+      <div class="tiny">운영 관리자 · 계정 전환은 구글 계정 메뉴</div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="card" x-show="error" style="border-color: var(--urgent); margin-bottom: 16px;">
+      <span class="field-error" x-text="error"></span>
+      <button class="text-btn" @click="load()">다시 시도</button>
+    </div>
+
+    <!-- ================= 운영 보드 (F2, F3, F4.3) ================= -->
+    <section x-show="route.name === 'board'">
+      <div class="topbar">
+        <div class="row" style="gap:12px">
+          <h1 x-text="koDate(boot.today)"></h1>
+          <span class="sub small">루티드 관리 화면</span>
+        </div>
+        <div class="search-box" @click.outside="searchOpen = false">
+          <input class="input" placeholder="고객 이름, 예식일, 연락처 뒷자리" x-model="search" @focus="searchOpen = true">
+          <div class="search-results" x-show="searchOpen && search.trim()">
+            <template x-for="r in searchResults" :key="r.id">
+              <button @click="go('customer', r.id)"><b x-text="r.name"></b> <span class="sub small" x-text="r.stage + ' · ' + (r.wedding || r.hope || '') + (r.last4 ? ' · ' + r.last4 : '')"></span></button>
+            </template>
+            <div class="empty" style="padding:10px 12px" x-show="!searchResults.length">찾는 고객 없음</div>
+          </div>
+        </div>
+      </div>
+      <div class="loading" x-show="!board">불러오는 중</div>
+      <template x-if="board">
+        <div class="board-grid">
+          <!-- 알림함 -->
+          <div class="card">
+            <div class="card-head">
+              <div class="row"><h2>알림함</h2><span class="badge-urgent" x-show="board.unread" x-text="board.unread + '건 미확인'"></span></div>
+              <button class="text-btn small" @click="readAll(board.alerts)">모두 읽음</button>
+            </div>
+            <div class="divider">
+              <template x-for="a in board.alerts" :key="a.id">
+                <div class="alert-row" :class="a.read && 'read'" @click="openAlert(a)">
+                  <span class="dot" :class="a.read && 'off'"></span>
+                  <span class="badge-urgent" x-show="a.urgent">급함</span>
+                  <span class="when" x-text="a.type"></span>
+                  <b class="ellipsis" style="max-width:140px" x-text="a.customerName"></b>
+                  <span class="grow ellipsis" x-text="a.content"></span>
+                  <span class="chan" x-text="'#' + a.channel"></span>
+                  <button class="text-btn small" x-show="!a.read" @click.stop="readAlert(a); board.unread = Math.max(0, board.unread - 1)">읽음</button>
+                </div>
+              </template>
+              <div class="empty" x-show="!board.alerts.length">알림 없음</div>
+            </div>
+          </div>
+
+          <!-- 오늘 할 일 -->
+          <div class="card">
+            <div class="card-head"><h2>오늘 할 일</h2><span class="sub small" x-text="taskProgress(board.tasks).d + ' / ' + taskProgress(board.tasks).n + ' 완료'"></span></div>
+            <div class="progress"><div :style="'width:' + taskProgress(board.tasks).pct + '%'"></div></div>
+            <div class="divider" style="margin-top:8px">
+              <template x-for="t in board.tasks" :key="t.id">
+                <div class="check-row">
+                  <button class="box" :class="t.done && 'on'" @click="toggleTask(t)" :aria-label="t.text"></button>
+                  <template x-if="taskEdit && taskEdit.id === t.id">
+                    <input class="input grow" x-model="taskEdit.text" x-init="$nextTick(() => $el.focus())"
+                      @keydown.enter.prevent="saveTaskEdit(t)" @keydown.escape="taskEdit = null" @blur="saveTaskEdit(t)">
+                  </template>
+                  <span class="grow" x-show="!(taskEdit && taskEdit.id === t.id)" :class="[t.done && 'done-text', t.source === '직접' && 'editable']"
+                    :title="t.source === '직접' ? '눌러서 고치기' : ''" @click="startTaskEdit(t)" x-text="(t.overdue ? '(밀림) ' : '') + t.text"></span>
+                  <span class="chip tiny" x-show="t.customerName" x-text="t.customerName"></span>
+                  <button class="text-btn tiny" x-show="t.source === '직접'" @click="deleteTask(t)">삭제</button>
+                </div>
+              </template>
+              <div class="empty" x-show="!board.tasks.length">오늘 할 일 없음</div>
+            </div>
+            <form class="row" style="margin-top:8px" @submit.prevent="addTask()">
+              <input class="input" placeholder="+ 새 업무 추가" x-model="newTask">
+              <button class="btn" type="submit">추가</button>
+            </form>
+          </div>
+
+          <!-- 월간 캘린더 -->
+          <div class="card">
+            <div class="card-head">
+              <h2>월간 캘린더 <span class="sub small" x-text="board.calendar.title"></span></h2>
+              <div class="row">
+                <button class="text-btn" @click="moveMonth(board.calendar.prev)" aria-label="이전 달">‹</button>
+                <button class="text-btn small" @click="moveMonth(boot.today.slice(0,7))">오늘</button>
+                <button class="text-btn" @click="moveMonth(board.calendar.next)" aria-label="다음 달">›</button>
+              </div>
+            </div>
+            <div class="cal">
+              <template x-for="d in ['일','월','화','수','목','금','토']"><div class="dow" x-text="d"></div></template>
+              <template x-for="day in board.calendar.days" :key="day.key">
+                <div class="day" :class="[!day.inMonth && 'out', day.key === boot.today && 'today']">
+                  <span x-text="day.day"></span>
+                  <template x-for="ev in day.events"><button class="ev" :class="ev.kind" @click="go('customer', ev.id)" x-text="ev.label"></button></template>
+                </div>
+              </template>
+            </div>
+            <div class="row tiny sub" style="margin-top:8px; gap:16px"><span>파란 칸: 예식</span><span>회색: 답사</span><span>테두리: 오늘</span></div>
+          </div>
+
+          <!-- 새 문의 -->
+          <div class="card">
+            <div class="card-head"><h2>새 문의 <span class="chip" x-text="board.newInquiries.length + '건'"></span></h2></div>
+            <template x-for="c in board.newInquiries" :key="c.id">
+              <button class="inq" @click="go('customer', c.id)">
+                <div class="between"><b x-text="c.name"></b><span class="badge-urgent" x-show="c.urgent">급함</span></div>
+                <div class="small sub" x-text="[c.type, c.people && c.people + '명', c.hopeLabel, c.slot].filter(Boolean).join(' · ')"></div>
+                <div class="small" style="margin-top:4px" x-text="c.availability || '예약 가능 여부 확인 중'"></div>
+                <div class="tiny sub" x-text="'유입: ' + (c.source || '미기재')"></div>
+              </button>
+            </template>
+            <div class="empty" x-show="!board.newInquiries.length">새 문의 없음</div>
+          </div>
+
+          <!-- 파이프라인 -->
+          <div class="card wide">
+            <div class="card-head"><h2>고객 파이프라인</h2></div>
+            <div class="kanban">
+              <template x-for="col in board.pipeline" :key="col.stage">
+                <div class="kcol">
+                  <div class="between small"><b x-text="col.stage"></b><span class="sub" x-text="col.cards.length"></span></div>
+                  <template x-for="c in col.cards" :key="c.id">
+                    <button class="kcard" :class="c.urgent && 'urgent'" @click="go('customer', c.id)">
+                      <div class="between"><b class="ellipsis" x-text="c.name"></b><span class="tiny" :style="c.urgent && 'color:var(--urgent)'" x-text="c.dday || (c.daysSinceContact !== null ? c.daysSinceContact + '일 경과' : '')"></span></div>
+                      <div class="tiny sub" x-text="(c.weddingLabel || c.hopeLabel || '날짜 미정') + (c.slot ? ' ' + c.slot : '')"></div>
+                      <div class="tiny" style="color:var(--urgent)" x-show="c.urgent" x-text="c.urgent"></div>
+                    </button>
+                  </template>
+                </div>
+              </template>
+            </div>
+            <button class="text-btn small" style="margin-top:8px" x-show="board.failed.length" @click="failedOpen = !failedOpen"
+              x-text="'실패 ' + board.failed.length + '건 ' + (failedOpen ? '▴' : '▾')"></button>
+            <div class="divider" x-show="failedOpen">
+              <template x-for="c in board.failed" :key="c.id">
+                <button class="alert-row read" style="width:100%; background:none; border:0; text-align:left" @click="go('customer', c.id)">
+                  <b x-text="c.name"></b>
+                  <span class="sub small" x-text="c.type"></span>
+                  <span class="grow small" x-text="(c.failStage ? c.failStage + ' 단계 · ' : '') + '사유: ' + (c.failReason || '미기재')"></span>
+                </button>
+              </template>
+              <button class="link-btn small" style="margin-top:6px" @click="customerFilter = '실패'; go('customers')">고객 목록에서 보기</button>
+            </div>
+          </div>
+        </div>
+      </template>
+    </section>
+
+    <!-- ================= 고객 목록 (F4.1, F4.2) ================= -->
+    <section x-show="route.name === 'customers'">
+      <div class="topbar">
+        <h1>고객 <span class="sub small" x-text="customers ? customers.length + '명' : ''"></span></h1>
+        <input class="input" style="max-width:320px" placeholder="이름, 예식일, 연락처 뒷자리" x-model="customerQuery">
+      </div>
+      <div class="between" style="margin-bottom:12px; gap:12px; flex-wrap:wrap">
+        <div class="chips-scroll">
+          <template x-for="s in stages"><button class="filter-chip" :class="customerFilter === s && 'on'" @click="customerFilter = s" x-text="s + ' ' + stageCount(s)"></button></template>
+        </div>
+        <div class="seg" style="width:240px">
+          <button :class="customerSort === 'recent' && 'on'" @click="customerSort = 'recent'">최근 문의순</button>
+          <button :class="customerSort === 'wedding' && 'on'" @click="customerSort = 'wedding'">예식일순</button>
+        </div>
+      </div>
+      <div class="loading" x-show="!customers">불러오는 중</div>
+      <div class="card" style="padding:0; overflow-x:auto" x-show="customers">
+        <table class="table">
+          <thead><tr><th>이름</th><th>행사</th><th>예식일·희망 날짜</th><th>슬롯</th><th>인원</th><th>단계</th><th>D-day</th><th>마지막 연락</th><th>메모</th></tr></thead>
+          <tbody>
+            <template x-for="c in customerRows" :key="c.id">
+              <tr class="clickable" :class="c.stage === '실패' && 'failed'" @click="go('customer', c.id)">
+                <td><span class="badge-urgent" x-show="c.urgent">급함</span> <b x-text="c.name"></b></td>
+                <td x-text="c.type"></td>
+                <td x-text="c.weddingLabel || c.hopeLabel"></td>
+                <td x-text="c.slot"></td>
+                <td x-text="c.people"></td>
+                <td><span :class="stageChip(c.stage)" x-text="c.stage"></span></td>
+                <td x-text="c.dday"></td>
+                <td x-text="c.daysSinceContact !== null ? c.daysSinceContact + '일 전' : ''"></td>
+                <td class="small" :style="c.urgent && 'color:var(--urgent)'" x-text="c.stage === '실패' ? '사유: ' + (c.failReason || '미기재') : c.urgent"></td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+        <div class="empty" style="padding:16px" x-show="customers && !customerRows.length">해당하는 고객 없음</div>
+      </div>
+    </section>
+
+    <!-- ================= 고객 사이클 (F5, F6, F7, F10) ================= -->
+    <section x-show="route.name === 'customer'">
+      <button class="text-btn small" @click="go('customers')">← 고객 목록</button>
+      <div class="loading" x-show="!customer">불러오는 중</div>
+      <template x-if="customer">
+        <div class="stack">
+          <div class="card">
+            <div class="between" style="flex-wrap:wrap">
+              <div>
+                <div class="row" style="flex-wrap:wrap">
+                  <h1 x-text="customer.card.name"></h1>
+                  <span :class="stageChip(customer.card.stage)" x-text="customer.card.stage"></span>
+                  <span class="chip" :class="customer.card.urgent && 'dday-urgent'" x-show="customer.card.dday" x-text="customer.card.dday"></span>
+                </div>
+                <div class="sub" x-text="[customer.card.type, customer.card.weddingLabel || customer.card.hopeLabel, customer.card.slot, customer.card.people && customer.card.people + '명'].filter(Boolean).join(' · ')"></div>
+              </div>
+              <div class="row">
+                <span class="num" x-text="phoneFull || customer.card.phoneMasked"></span>
+                <button class="link-btn small" x-show="!phoneFull && customer.card.phoneMasked" @click="revealPhone()">연락처 보기</button>
+                <a class="btn" :href="customer.sheetUrl" target="_blank">시트에서 고치기</a>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h3>진행 여정</h3><span class="tiny sub" x-text="customer.journey.filter(s => s.state === 'done').length + ' / 10'"></span></div>
+            <div class="journey">
+              <template x-for="(s, i) in customer.journey" :key="i">
+                <div class="step" :class="s.state">
+                  <div class="s-label" x-text="(i + 1) + '. ' + s.label"></div>
+                  <div class="tiny" x-text="s.date"></div>
+                </div>
+              </template>
+            </div>
+          </div>
+
+          <div class="next-band" :class="customer.next.urgent && 'urgent'">
+            <div>
+              <div class="tiny" :style="'color:' + (customer.next.urgent ? 'var(--urgent)' : 'var(--primary)')" x-text="customer.next.urgent ? '급함 · 다음 할 일' : '다음 할 일'"></div>
+              <b x-text="customer.next.text"></b> <span class="sub small" x-text="customer.next.date"></span>
+            </div>
+            <div class="row">
+              <button class="btn primary" x-show="customer.card.stage === '문의' && !customer.briefing.firstContact" @click="firstContact(customer.card.id, () => load())">첫 연락 완료</button>
+              <button class="btn" x-show="customer.briefing.draft" @click="copy(customer.briefing.draft)">문자 초안 복사</button>
+            </div>
+          </div>
+
+          <div class="cycle-grid">
+            <div class="stack">
+              <!-- 문의 브리핑 -->
+              <div class="card" x-show="customer.briefing.status || customer.briefing.inquiry">
+                <div class="card-head"><h3>문의 브리핑</h3><span class="chip tiny" x-text="customer.briefing.status === '실패' ? '브리핑 생성 실패' : 'Gemini 초안'"></span></div>
+                <p style="margin:0 0 8px" x-text="customer.briefing.summary || customer.briefing.inquiry"></p>
+                <div class="small" x-show="customer.card.availability"><span class="sub">날짜</span> <span x-text="customer.card.availability"></span></div>
+                <div class="small" x-show="customer.briefing.quote"><span class="sub">홈페이지 견적</span> <span x-text="customer.briefing.quote"></span></div>
+                <div x-show="customer.briefing.callPoints.length" style="margin-top:8px">
+                  <div class="small sub">통화 포인트</div>
+                  <ul style="margin:4px 0 0; padding-left:20px"><template x-for="p in customer.briefing.callPoints"><li x-text="p"></li></template></ul>
+                </div>
+                <div x-show="customer.briefing.draft" style="margin-top:12px">
+                  <div class="between"><span class="small sub">첫 연락 문자 초안 — 확인 후 직접 보내세요</span><button class="link-btn small" @click="copy(customer.briefing.draft)">복사</button></div>
+                  <div class="draft" style="margin-top:4px" x-text="customer.briefing.draft"></div>
+                </div>
+                <button class="text-btn small" style="margin-top:8px" :disabled="briefingBusy" @click="regenerateBriefing()"
+                  x-text="briefingBusy ? '새 초안 만드는 중' : (customer.briefing.draft ? '초안 다시 생성' : '브리핑 다시 만들기')"></button>
+              </div>
+
+              <!-- 상담 기록 -->
+              <div class="card">
+                <div class="card-head"><h3>상담 기록 <span class="chip tiny" x-text="customer.consults.length + '건'"></span></h3><button class="btn primary" @click="openConsult(customer.card.id)">+ 기록 추가</button></div>
+                <div class="thumbs">
+                  <template x-for="(p, i) in (photos ? photos.photos : [])" :key="p.id">
+                    <button class="thumb" :style="p.thumb && ('background-image:url(' + p.thumb + ')')" @click="openViewer(customer.card.id, photos.photos, i)" :aria-label="p.name"></button>
+                  </template>
+                  <label class="thumb add-photo" :class="uploading && 'busy'">
+                    <span x-text="uploading ? '올리는 중' : '+ 사진'"></span>
+                    <input type="file" accept="image/*" multiple hidden :disabled="uploading > 0" @change="uploadPhotos($event)">
+                  </label>
+                  <a class="small" style="align-self:center" x-show="photos && photos.folderUrl" :href="photos && photos.folderUrl" target="_blank">드라이브 폴더 열기</a>
+                </div>
+                <template x-for="c in customer.consults" :key="c.id">
+                  <div class="consult">
+                    <div class="between">
+                      <div class="row"><b class="num" x-text="c.dateLabel"></b><span class="chip tiny" x-text="c.method"></span><span class="tiny sub" x-text="'작성 ' + c.author"></span></div>
+                      <div class="row"><button class="text-btn small" @click="openConsult(customer.card.id, c)">수정</button><button class="text-btn small" @click="deleteConsult(c)">삭제</button></div>
+                    </div>
+                    <p style="margin:6px 0 0; white-space:pre-wrap" x-text="c.summary"></p>
+                    <div class="tiny sub" x-show="c.updatedAt" x-text="'수정 ' + c.updatedAt"></div>
+                  </div>
+                </template>
+                <div class="empty" x-show="!customer.consults.length">상담 기록 없음</div>
+              </div>
+
+              <!-- 요청사항 -->
+              <div class="card">
+                <div class="card-head">
+                  <h3>요청사항 <span class="tiny sub">D-7 고객 확인 · 당일 체크</span></h3>
+                  <button class="btn" @click="startRequest()">+ 요청 추가</button>
+                </div>
+                <div style="overflow-x:auto">
+                  <table class="table">
+                    <thead><tr><th>파트</th><th>요청 내용</th><th>출처</th><th>고객 확인</th><th>당일</th><th></th></tr></thead>
+                    <tbody>
+                      <template x-for="r in customer.requests" :key="r.id">
+                        <tr>
+                          <td><span class="chip" x-text="r.part"></span></td>
+                          <td x-text="r.content"></td>
+                          <td class="small sub" x-text="r.sourceId"></td>
+                          <td><button class="box" :class="r.confirmedAt && 'on'" @click="toggleConfirm(r)" aria-label="고객 확인"></button></td>
+                          <td class="small" :class="r.status === '빠짐' && 'missed-label'" x-text="r.status === '대기' ? '' : r.status + (r.checker ? ' · ' + r.checker : '')"></td>
+                          <td class="row"><button class="text-btn small" @click="startRequest(r)">수정</button><button class="text-btn small" @click="deleteRequest(r)">삭제</button></td>
+                        </tr>
+                      </template>
+                    </tbody>
+                  </table>
+                </div>
+                <div class="empty" x-show="!customer.requests.length">요청사항 없음</div>
+                <div class="consult" x-show="reqEdit">
+                  <template x-if="reqEdit">
+                    <div class="stack">
+                      <div class="chips-scroll"><template x-for="p in parts"><button class="filter-chip" :class="reqEdit.part === p && 'on'" @click="reqEdit.part = p" x-text="p"></button></template></div>
+                      <input class="input" maxlength="80" placeholder="당일 눈으로 확인할 한 줄 (예: 아치 비대칭, 그린·화이트)" x-model="reqEdit.content">
+                      <input class="input" placeholder="사진 링크 (선택 — 드라이브 파일 주소)" x-model="reqEdit.photo">
+                      <div class="field-error" x-show="reqEdit.error" x-text="reqEdit.error"></div>
+                      <div class="tiny sub" x-show="reqEdit.id">내용을 고치면 D-7 고객 확인이 풀립니다</div>
+                      <div class="row"><button class="btn primary" @click="saveRequestEdit()">저장</button><button class="btn" @click="reqEdit = null">취소</button></div>
+                    </div>
+                  </template>
+                </div>
+              </div>
+            </div>
+
+            <div class="stack">
+              <!-- 입금 -->
+              <div class="card">
+                <div class="card-head"><h3>입금 내역</h3><span class="small sub" x-show="customer.payments.total" x-text="'총액 ' + customer.payments.total"></span></div>
+                <template x-for="p in customer.payments.rows" :key="p.kind">
+                  <div class="pay-row" :class="!p.paid && 'unpaid'">
+                    <div><div x-text="p.kind"></div><div class="tiny sub" x-text="p.paid ? koDate(p.paidDate) + ' 입금' : '미입금'"></div></div>
+                    <div class="row"><span class="amount" x-text="p.amount"></span>
+                      <button class="btn" :class="!p.paid && 'primary'" @click="togglePayment(p)" x-text="p.paid ? '되돌리기' : '입금 확인'"></button></div>
+                  </div>
+                </template>
+                <div class="empty" x-show="!customer.payments.rows.length">계약 전 — 입금 정보 없음</div>
+              </div>
+
+              <!-- D-day 일정 -->
+              <div class="card">
+                <div class="card-head"><h3>D-day 일정</h3><span class="tiny sub">D-90 ~ D+30</span></div>
+                <template x-for="s in customer.schedule"><div class="sched" :class="[s.past && 'past', s.next && 'next']">
+                  <span class="p" x-text="s.point"></span><span class="grow" x-text="s.text"></span><span class="tiny sub" x-text="s.date"></span></div></template>
+                <div class="empty" x-show="!customer.schedule.length">예식일이 정해지면 생깁니다</div>
+              </div>
+
+              <!-- 예식 상세 · 영업 메모 -->
+              <div class="card" x-show="customer.detail.length || customer.sales.length">
+                <div class="card-head"><h3>예식 상세</h3></div>
+                <dl class="kv"><template x-for="d in customer.detail.concat(customer.sales)"><div style="display:contents"><dt x-text="d.key"></dt><dd x-text="d.value"></dd></div></template></dl>
+              </div>
+            </div>
+          </div>
+        </div>
+      </template>
+    </section>
+
+    <!-- ================= 알림함 (F2.1–F2.6) ================= -->
+    <section x-show="route.name === 'alerts'">
+      <div class="topbar">
+        <div class="row"><h1>알림함</h1>
+          <div class="seg" style="width:220px"><button :class="alertTab === 'unread' && 'on'" @click="alertTab = 'unread'" x-text="'안 읽음 ' + unread"></button><button :class="alertTab === 'all' && 'on'" @click="alertTab = 'all'">전체</button></div>
+        </div>
+        <button class="text-btn" @click="readAll(alerts)">모두 읽음</button>
+      </div>
+      <div class="chips-scroll" style="margin-bottom:12px">
+        <template x-for="ch in ['전체','새-문의','오늘-할-일','예식-알람']"><button class="filter-chip" :class="alertChannel === ch && 'on'" @click="alertChannel = ch" x-text="ch === '전체' ? '전체' : '#' + ch"></button></template>
+      </div>
+      <div class="loading" x-show="!alerts">불러오는 중</div>
+      <template x-for="g in alertGroups" :key="g.label">
+        <div class="card" style="margin-bottom:12px">
+          <div class="small sub" style="margin-bottom:4px" x-text="g.label"></div>
+          <div class="divider">
+            <template x-for="a in g.items" :key="a.id">
+              <div class="alert-row" :class="a.read && 'read'" @click="openAlert(a)">
+                <span class="dot" :class="a.read && 'off'"></span>
+                <span class="badge-urgent" x-show="a.urgent">급함</span>
+                <span class="when" x-text="a.type"></span>
+                <b class="ellipsis" style="max-width:140px" x-text="a.customerName"></b>
+                <span class="grow ellipsis" x-text="a.content"></span>
+                <span class="chan" x-text="'#' + a.channel"></span>
+                <span class="tiny sub" x-text="a.at.slice(11, 16)"></span>
+                <button class="text-btn small" x-show="!a.read" @click.stop="readAlert(a)">읽음</button>
+              </div>
+            </template>
+          </div>
+        </div>
+      </template>
+      <div class="empty" x-show="alerts && !alertGroups.length" x-text="alertTab === 'unread' ? '안 읽은 알림 없음' : '알림 없음'"></div>
+    </section>
+
+    <!-- ================= 오늘 (F8, 모바일) ================= -->
+    <section x-show="route.name === 'today'">
+      <div class="between" style="margin-bottom:16px">
+        <h1 x-text="today ? today.todayLabel : koDate(boot.today)"></h1>
+        <button class="btn" @click="go('alerts')">알림 <span class="count" x-show="unread" x-text="unread"></span></button>
+      </div>
+      <div class="loading" x-show="!today">불러오는 중</div>
+      <template x-if="today">
+        <div class="stack">
+          <div x-show="today.urgent.length">
+            <div class="small" style="color:var(--urgent); font-weight:600" x-text="'즉시 확인 필요 ' + today.urgent.length + '건'"></div>
+            <template x-for="c in today.urgent" :key="c.id">
+              <button class="urgent-card" @click="openSheet(c)">
+                <div class="between"><b x-text="c.name"></b><span class="badge-urgent">급함</span></div>
+                <div style="color:var(--urgent)" x-text="c.urgent"></div>
+              </button>
+            </template>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h3>오늘 할 일 <span class="chip" x-text="today.tasks.length + '개'"></span></h3><span class="small sub" x-text="'진행률 ' + taskProgress(today.tasks).d + '/' + taskProgress(today.tasks).n"></span></div>
+            <div class="divider">
+              <template x-for="t in today.tasks" :key="t.id">
+                <div class="check-row" style="min-height:56px">
+                  <button class="box" :class="t.done && 'on'" @click="toggleTask(t)" :aria-label="t.text"></button>
+                  <span class="grow" :class="t.done && 'done-text'" x-text="(t.overdue ? '(밀림) ' : '') + t.text"></span>
+                  <span class="chip tiny" x-show="t.customerName" x-text="t.customerName"></span>
+                </div>
+              </template>
+              <div class="empty" x-show="!today.tasks.length">오늘 할 일 없음</div>
+            </div>
+          </div>
+
+          <div>
+            <div class="between" style="margin-bottom:8px"><h3>이번 주 행사 <span class="sub small" x-text="today.week.length + '팀'"></span></h3></div>
+            <div class="h-scroll">
+              <template x-for="c in today.week" :key="c.id">
+                <button class="event-card" @click="go('dayof', c.id)">
+                  <div class="between small"><span x-text="c.weddingLabel + ' · ' + c.slot"></span><span class="chip" x-text="c.dday"></span></div>
+                  <h3 style="margin-top:8px" x-text="c.name"></h3>
+                  <div class="small sub" x-text="c.people ? '하객 ' + c.people + '명' : ''"></div>
+                  <div class="small" style="color:var(--primary); margin-top:8px">체크리스트 점검 →</div>
+                </button>
+              </template>
+              <div class="empty" x-show="!today.week.length">이번 주 행사 없음</div>
+            </div>
+          </div>
+        </div>
+      </template>
+    </section>
+
+    <!-- ================= 예식 당일 체크 (F9) ================= -->
+    <section x-show="route.name === 'dayof'">
+      <div class="loading" x-show="!dayof">불러오는 중</div>
+      <template x-if="dayof && !dayof.selected"><div class="card empty">오늘 예식 없음</div></template>
+      <template x-if="dayof && dayof.selected">
+        <div class="stack">
+          <select class="select" x-show="dayof.events.length > 1" @change="go('dayof', $event.target.value)">
+            <template x-for="e in dayof.events"><option :value="e.id" :selected="e.id === dayof.selected.id" x-text="e.label"></option></template>
+          </select>
+          <div class="card">
+            <div class="between"><h2 x-text="dayof.selected.name"></h2><b style="color:var(--primary)" x-text="dayProgress.d + ' / ' + dayProgress.n + ' 확인'"></b></div>
+            <div class="sub" x-text="dayof.selected.dateLabel + ' · ' + dayof.selected.slot + ' · ' + dayof.selected.people + '명 · ' + dayof.selected.dday"></div>
+            <div class="progress" style="margin-top:12px"><div :style="'width:' + dayProgress.pct + '%'"></div></div>
+          </div>
+          <div class="card" style="padding:0">
+            <button class="between" style="width:100%; padding:14px 16px; background:var(--surface-sub); border:0; border-radius:8px 8px 0 0" @click="timetableOpen = !timetableOpen">
+              <b>현장 주요 일정</b><span x-text="timetableOpen ? '접기' : '펼치기'"></span></button>
+            <div x-show="timetableOpen" style="padding:8px 16px 12px">
+              <template x-for="t in dayof.timetable"><div class="sched"><span class="p num" x-text="t.time"></span><span x-text="t.text"></span></div></template>
+              <div class="empty" x-show="!dayof.timetable.length">타임테이블 없음</div>
+            </div>
+          </div>
+          <div class="chips-scroll">
+            <template x-for="p in ['전체'].concat(parts)"><button class="filter-chip" :class="dayPart === p && 'on'" @click="dayPart = p" x-text="p + ' ' + partRemain(p)"></button></template>
+          </div>
+          <div>
+            <template x-for="r in dayRequests" :key="r.id">
+              <div class="req-card" :class="[r.status === '확인' && 'done', r.status === '빠짐' && 'missed']">
+                <button class="big-box" :class="r.status === '확인' && 'on'" @click="toggleCheck(r)" :aria-label="r.content" x-text="r.status === '확인' ? '✓' : ''"></button>
+                <div class="grow">
+                  <div class="between"><span class="chip" x-text="r.part"></span>
+                    <button class="text-btn small" style="color:var(--urgent)" x-show="r.status === '대기'" @click="startMiss(r)">빠짐</button>
+                    <span class="missed-label small" x-show="r.status === '빠짐'">빠짐</span></div>
+                  <div class="req-text" style="margin-top:6px; font-size:16px; line-height:24px" x-text="r.content"></div>
+                  <div class="row" style="margin-top:6px">
+                    <button class="thumb" style="width:56px; height:56px" x-show="r.photoId && dayThumbs[r.photoId]" :style="dayThumbs[r.photoId] && ('width:56px;height:56px;background-image:url(' + dayThumbs[r.photoId] + ')')" @click="openRequestPhoto(r, dayof.selected.id)" aria-label="레퍼런스 사진"></button>
+                    <span class="small sub" x-show="r.checker" x-text="r.checker + ' ' + r.checkedAt + (r.status === '빠짐' ? ' 기록' : ' 확인')"></span>
+                  </div>
+                  <div class="stack" style="margin-top:8px" x-show="missFor === r.id">
+                    <input class="input" placeholder="빠진 사유 한 줄" x-model="missReason" @keydown.enter="saveMiss(r)">
+                    <div class="row"><button class="btn primary" @click="saveMiss(r)">기록</button><button class="btn" @click="missFor = ''">취소</button></div>
+                  </div>
+                </div>
+              </div>
+            </template>
+            <div class="empty" x-show="!dayRequests.length">요청사항 없음</div>
+          </div>
+        </div>
+      </template>
+    </section>
+  </main>
+
+  <!-- 모바일 하단 탭 (운영자만) -->
+  <nav class="tabbar" x-show="boot.role === 'operator'">
+    <button :class="route.name === 'today' && 'on'" @click="go('today')">오늘</button>
+    <button :class="(route.name === 'consult' || consultOpen) && 'on'" @click="go('consult')">기록</button>
+    <button :class="route.name === 'dayof' && 'on'" @click="go('dayof')">당일 체크</button>
+  </nav>
+
+  <!-- 상담 기록 추가 — 데스크톱 우측 패널 / 모바일 전체 화면 (F6.2–F6.4, F7.2) -->
+  <div class="overlay" x-show="consultOpen && !mobile" @click="closeConsult()"></div>
+  <div class="panel" :class="mobile ? 'full' : 'side'" x-show="consultOpen">
+    <div class="panel-head">
+      <button class="text-btn" x-show="mobile" @click="closeConsult()">← 기록</button>
+      <h2 x-text="consult.id ? '상담 기록 수정' : '상담 기록 추가'"></h2>
+      <button class="text-btn" x-show="!mobile" @click="closeConsult()" aria-label="닫기">✕</button>
+    </div>
+    <div class="panel-body stack">
+      <div>
+        <div class="small sub">고객</div>
+        <div class="row" x-show="consult.customerId"><b class="grow" x-text="consultTargetLabel"></b><button class="link-btn small" x-show="!consult.id" @click="consult.customerId = ''">바꾸기</button></div>
+        <div x-show="!consult.customerId">
+          <input class="input" placeholder="고객 이름 검색" x-model="consultQuery">
+          <template x-for="t in consultTargetList" :key="t.id">
+            <button class="inq" @click="consult.customerId = t.id; consultQuery = ''"><b x-text="t.name"></b> <span class="small sub" x-text="[t.type, t.date, t.stage].filter(Boolean).join(' · ')"></span></button>
+          </template>
+        </div>
+        <div class="field-error" x-show="consult.errors.customerId" x-text="consult.errors.customerId"></div>
+      </div>
+      <div>
+        <div class="small sub">상담 일시</div>
+        <input class="input" type="date" x-model="consult.date">
+        <div class="field-error" x-show="consult.errors.date" x-text="consult.errors.date"></div>
+      </div>
+      <div>
+        <div class="small sub">상담 방식</div>
+        <div class="seg"><template x-for="m in methods"><button :class="consult.method === m && 'on'" @click="consult.method = m" x-text="m"></button></template></div>
+        <div class="field-error" x-show="consult.errors.method" x-text="consult.errors.method"></div>
+      </div>
+      <div>
+        <div class="between"><span class="small sub">상담 내용 요약</span><span class="tiny sub" x-show="!consult.id">작성 중 자동 임시저장</span></div>
+        <textarea class="textarea" placeholder="원하는 것, 걱정하는 것, 정해진 것" x-model="consult.summary"></textarea>
+        <div class="field-error" x-show="consult.errors.summary" x-text="consult.errors.summary"></div>
+        <div class="tiny sub">사진은 고객 사이클의 "+ 사진"으로 올리거나 드라이브 고객 폴더(루티드/고객/예식일_이름/레퍼런스)에 넣으면 보입니다</div>
+      </div>
+      <div x-show="!consult.id">
+        <div class="between"><span class="small sub">요청사항 (당일 체크리스트로 갑니다)</span><button class="link-btn small" @click="addConsultRequest()">+ 추가</button></div>
+        <template x-for="(r, i) in consult.requests" :key="i">
+          <div class="consult stack">
+            <div class="chips-scroll"><template x-for="p in parts"><button class="filter-chip" :class="r.part === p && 'on'" @click="r.part = p" x-text="p"></button></template></div>
+            <div class="row"><input class="input" maxlength="80" placeholder="당일 확인할 한 줄" x-model="r.content"><button class="text-btn small" @click="consult.requests.splice(i, 1)">버리기</button></div>
+            <div class="field-error" x-show="consult.errors['req' + i]" x-text="consult.errors['req' + i]"></div>
+          </div>
+        </template>
+      </div>
+    </div>
+    <div class="panel-foot">
+      <button class="btn" x-show="!consult.id && (consult.summary || consult.requests.length)" @click="clearDraft()">임시저장 삭제</button>
+      <button class="btn primary block grow" :disabled="consultSaving" @click="saveConsult()" x-text="consultSaving ? '저장 중' : '상담 기록 저장'"></button>
+    </div>
+  </div>
+
+  <!-- Gemini 요청사항 후보 — 채택·버리기 (F6.8, F7.6) -->
+  <div class="overlay" x-show="suggest" @click="if (!suggestPending) suggest = null"></div>
+  <div class="panel" :class="mobile ? 'bottom' : 'side'" x-show="suggest">
+    <template x-if="suggest">
+      <div style="display:contents">
+        <div class="panel-head"><h2>요청사항 후보 <span class="chip tiny">Gemini 초안</span></h2><button class="text-btn" @click="suggest = null">닫기</button></div>
+        <div class="panel-body stack">
+          <div class="small sub">상담 요약에서 뽑은 후보입니다. 채택한 것만 요청사항 표와 당일 체크리스트에 들어갑니다.</div>
+          <div class="loading" x-show="suggest.loading">후보 찾는 중</div>
+          <div class="field-error" x-show="suggest.error" x-text="'후보를 만들지 못했습니다. ' + suggest.error"></div>
+          <div class="empty" x-show="!suggest.loading && !suggest.error && !suggest.items.length">뽑을 요청사항이 없습니다</div>
+          <template x-for="(item, i) in suggest.items" :key="i">
+            <div class="consult" :style="item.state === 'discarded' && 'opacity:.45'">
+              <div class="between"><span class="chip" x-text="item.part"></span>
+                <span class="small" style="color:var(--primary)" x-show="item.state === 'adopted'">채택함</span>
+                <span class="small sub" x-show="item.state === 'discarded'">버림</span></div>
+              <div style="margin-top:6px" x-text="item.content"></div>
+              <div class="row" style="margin-top:8px" x-show="!item.state || item.state === 'saving'">
+                <button class="btn primary" :disabled="item.state === 'saving'" @click="adoptSuggestion(item)" x-text="item.state === 'saving' ? '저장 중' : '채택'"></button>
+                <button class="btn" :disabled="item.state === 'saving'" @click="item.state = 'discarded'">버리기</button>
+              </div>
+            </div>
+          </template>
+        </div>
+        <div class="panel-foot"><button class="btn block grow" @click="suggest = null" x-text="suggestPending ? '나머지 버리고 닫기' : '닫기'"></button></div>
+      </div>
+    </template>
+  </div>
+
+  <!-- 고객 요약 바텀시트 (F8.4) -->
+  <div class="overlay" x-show="sheet" @click="sheet = null"></div>
+  <div class="panel bottom" x-show="sheet">
+    <template x-if="sheet">
+      <div>
+        <div class="panel-head"><h2 x-text="sheet.name"></h2><button class="text-btn" @click="sheet = null">닫기</button></div>
+        <div class="panel-body stack">
+          <div style="color:var(--urgent)" x-text="sheet.urgent"></div>
+          <div class="sub" x-text="[sheet.type, sheet.weddingLabel || sheet.hopeLabel, sheet.slot, sheet.people && sheet.people + '명'].filter(Boolean).join(' · ')"></div>
+          <div class="small" x-show="sheet.availability" x-text="'날짜: ' + sheet.availability"></div>
+          <div class="small" x-text="'연락처 ' + sheet.phoneMasked"></div>
+        </div>
+        <div class="panel-foot">
+          <button class="btn primary grow" x-show="sheet.stage === '문의'" @click="sheetFirstContact()">첫 연락 완료</button>
+          <button class="btn grow" @click="openSheetCustomer()">고객 사이클 열기</button>
+        </div>
+      </div>
+    </template>
+  </div>
+
+  <!-- 사진 전체 화면 (F6.6, F9.6) -->
+  <div class="viewer" x-show="viewer" @keydown.escape.window="viewer = null">
+    <template x-if="viewer">
+      <div style="width:100%; height:100%; display:flex; align-items:center; justify-content:center">
+        <img :src="viewer.src" alt="레퍼런스 사진">
+        <button class="nav" style="left:12px" x-show="viewer.list.length > 1" @click="stepViewer(-1)">‹</button>
+        <button class="nav" style="right:12px" x-show="viewer.list.length > 1" @click="stepViewer(1)">›</button>
+        <button class="close" @click="viewer = null">닫기</button>
+      </div>
+    </template>
+  </div>
+
+  <!-- 토스트 -->
+  <div class="toast" x-show="toast" x-transition.opacity>
+    <span x-text="toast && toast.msg"></span>
+    <button x-show="toast && toast.retry" @click="retryToast()">다시 시도</button>
+  </div>
+</div>
+</body>
+</html>

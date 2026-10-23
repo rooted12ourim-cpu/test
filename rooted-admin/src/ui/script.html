@@ -1,0 +1,372 @@
+<script>
+/* 서버 호출 — google.script.run을 Promise로 감싼다. 첫 인자는 항상 접근 토큰. */
+function call(name, ...args) {
+  return new Promise((resolve, reject) => {
+    google.script.run
+      .withSuccessHandler(resolve)
+      .withFailureHandler(err => reject(new Error((err && err.message) || String(err))))[name](BOOT.token, ...args);
+  });
+}
+
+const DRAFT_KEY = 'rooted:consult-draft';
+const MOBILE_QUERY = window.matchMedia('(max-width: 899px)');
+
+function storageGet(key) { try { return JSON.parse(localStorage.getItem(key) || 'null'); } catch (e) { return null; } }
+function storageSet(key, v) { try { localStorage.setItem(key, JSON.stringify(v)); } catch (e) { /* 저장 불가 환경은 무시 */ } }
+function storageDel(key) { try { localStorage.removeItem(key); } catch (e) { /* 무시 */ } }
+
+/** 예식일(없으면 희망 날짜) 빠른 순, 날짜 없는 고객은 맨 뒤 (F4.4) */
+function sortByWedding(rows) {
+  const key = c => c.wedding || c.hope || '9999';
+  return rows.slice().sort((a, b) => (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0));
+}
+
+/** 폰 사진을 긴 변 1600px JPEG로 줄여 data URL로 (F6.7) — 업로드 시간을 줄인다. */
+function shrinkImage(file, maxSide = 1600) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(img.width * scale); canvas.height = Math.round(img.height * scale);
+      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+      URL.revokeObjectURL(url);
+      resolve(canvas.toDataURL('image/jpeg', 0.85));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('사진을 읽을 수 없습니다')); };
+    img.src = url;
+  });
+}
+
+function emptyConsult(customerId) {
+  return { id: '', customerId: customerId || '', date: BOOT.today, method: '', summary: '', requests: [], errors: {} };
+}
+
+function app() {
+  return {
+    boot: BOOT,
+    mobile: MOBILE_QUERY.matches,
+    route: { name: '', id: '' },
+    unread: 0,
+    loading: false,
+    error: '',
+    toast: null,
+    parts: ['주방', '무대', '플라워', '음향', '서빙'],
+    methods: ['전화', '답사', '미팅', '카톡'],
+    stages: ['전체', '문의', '연락', '답사', '견적', '계약', '완료', '실패'],
+
+    board: null, calMonth: '', newTask: '', search: '', searchOpen: false, taskEdit: null, failedOpen: false,
+    customers: null, customerFilter: '전체', customerQuery: '', customerSort: 'recent',
+    customer: null, phoneFull: '', photos: null, uploading: 0, briefingBusy: false, suggest: null,
+    alerts: null, alertTab: 'unread', alertChannel: '전체',
+    today: null, sheet: null,
+    dayof: null, dayPart: '전체', timetableOpen: true, dayThumbs: {}, dayPhotoList: [], missFor: '', missReason: '',
+    consultOpen: false, consult: emptyConsult(), consultTargets: [], consultSaving: false, consultQuery: '',
+    reqEdit: null,
+    viewer: null,
+
+    init() {
+      MOBILE_QUERY.addEventListener('change', e => { this.mobile = e.matches; });
+      window.addEventListener('hashchange', () => this.applyHash());
+      if (!location.hash) location.hash = this.boot.role === 'staff' ? '#/dayof' : (this.mobile ? '#/today' : '#/board');
+      this.applyHash();
+      this.$watch('consult', v => { if (this.consultOpen && !v.id) storageSet(DRAFT_KEY, v); });
+    },
+
+    /* ---------- 이동 ---------- */
+    go(name, id) { location.hash = '#/' + name + (id ? '/' + encodeURIComponent(id) : ''); },
+    applyHash() {
+      const [, name = '', id = ''] = location.hash.split('/');
+      let route = name || 'board';
+      if (this.boot.role === 'staff') route = 'dayof';
+      this.route = { name: route, id: decodeURIComponent(id || '') };
+      window.scrollTo(0, 0);
+      this.load();
+    },
+    async load() {
+      this.error = '';
+      const r = this.route;
+      try {
+        if (this.boot.role !== 'staff') this.refreshNav();
+        if (r.name === 'board') this.board = await call('apiBoard', this.calMonth || '');
+        if (r.name === 'customers') this.customers = await call('apiCustomers');
+        if (r.name === 'customer') { this.customer = null; this.phoneFull = ''; this.photos = null; this.customer = await call('apiCustomer', r.id); this.loadPhotos(r.id); }
+        if (r.name === 'alerts') this.alerts = await call('apiAlerts');
+        if (r.name === 'today') this.today = await call('apiToday');
+        if (r.name === 'consult') this.openConsult(r.id);
+        if (r.name === 'dayof') await this.loadDayOf(r.id);
+      } catch (e) { this.error = e.message; }
+    },
+    async refreshNav() { try { this.unread = (await call('apiNav')).unread; } catch (e) { /* 배지는 실패해도 무시 */ } },
+
+    /* ---------- 공통 ---------- */
+    showToast(msg, retry) {
+      this.toast = { msg, retry };
+      clearTimeout(this._toastTimer);
+      this._toastTimer = setTimeout(() => { this.toast = null; }, retry ? 8000 : 2500);
+    },
+    /** 화면을 먼저 바꾸고 저장한다. 실패하면 되돌리고 다시 시도 버튼을 띄운다. */
+    async optimistic(apply, revert, request, okMsg) {
+      apply();
+      try { await request(); if (okMsg) this.showToast(okMsg); }
+      catch (e) { revert(); this.showToast('저장하지 못했습니다. ' + e.message, () => this.optimistic(apply, revert, request, okMsg)); }
+    },
+    retryToast() { const r = this.toast && this.toast.retry; this.toast = null; if (r) r(); },
+    stageChip(stage) { return stage === '실패' ? 'chip fail' : (stage === '계약' || stage === '완료' ? 'chip blue' : 'chip'); },
+    copy(text) {
+      const done = () => this.showToast('복사했습니다');
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done).catch(() => this.copyFallback(text, done));
+      else this.copyFallback(text, done);
+    },
+    copyFallback(text, done) {
+      const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); done(); } catch (e) { this.showToast('복사하지 못했습니다'); }
+      ta.remove();
+    },
+
+    /* ---------- 운영 보드 ---------- */
+    async moveMonth(month) { this.calMonth = month; try { this.board.calendar = (await call('apiBoard', month)).calendar; } catch (e) { this.showToast(e.message); } },
+    get searchResults() {
+      const q = this.search.trim();
+      const list = (this.board && this.board.search) || [];
+      if (!q) return [];
+      return list.filter(c => c.name.includes(q) || (c.last4 && c.last4.includes(q)) || (c.wedding || '').includes(q) || (c.hope || '').includes(q)).slice(0, 10);
+    },
+    toggleTask(t, list) {
+      const was = t.done;
+      this.optimistic(() => { t.done = !was; }, () => { t.done = was; }, () => call('apiSetTask', t.id, !was));
+    },
+    async addTask() {
+      const text = this.newTask.trim();
+      if (!text) return;
+      try { await call('apiAddTask', text); this.newTask = ''; this.board = await call('apiBoard', this.calMonth || ''); this.showToast('저장했습니다'); }
+      catch (e) { this.showToast('저장하지 못했습니다. ' + e.message); }
+    },
+    startTaskEdit(t) { if (t.source === '직접') this.taskEdit = { id: t.id, text: t.text }; },
+    /** Enter와 blur가 함께 와도 한 번만 저장한다. */
+    saveTaskEdit(t) {
+      if (!this.taskEdit || this.taskEdit.id !== t.id) return;
+      const text = this.taskEdit.text.trim(); const was = t.text;
+      this.taskEdit = null;
+      if (!text || text === was) return;
+      this.optimistic(() => { t.text = text; }, () => { t.text = was; }, () => call('apiEditTask', t.id, text), '고쳤습니다');
+    },
+    async deleteTask(t) {
+      const list = this.board.tasks; const i = list.indexOf(t);
+      this.optimistic(() => list.splice(i, 1), () => list.splice(i, 0, t), () => call('apiDeleteTask', t.id), '삭제했습니다');
+    },
+    taskProgress(tasks) { const n = (tasks || []).length; const d = (tasks || []).filter(t => t.done).length; return { n, d, pct: n ? Math.round(d * 100 / n) : 0 }; },
+
+    /* ---------- 알림 ---------- */
+    openAlert(a) {
+      if (!a.read) { a.read = true; this.unread = Math.max(0, this.unread - 1); call('apiReadAlert', a.id).catch(() => { a.read = false; this.unread++; }); }
+      if (a.customerId) this.go('customer', a.customerId);
+    },
+    readAlert(a) {
+      if (a.read) return;
+      this.optimistic(() => { a.read = true; this.unread = Math.max(0, this.unread - 1); }, () => { a.read = false; this.unread++; }, () => call('apiReadAlert', a.id));
+    },
+    readAll(list) {
+      const unreadOnes = (list || []).filter(a => !a.read); const before = this.unread;
+      this.optimistic(() => { unreadOnes.forEach(a => { a.read = true; }); this.unread = 0; }, () => { unreadOnes.forEach(a => { a.read = false; }); this.unread = before; }, () => call('apiReadAllAlerts'), '모두 읽음');
+    },
+    get alertGroups() {
+      if (!this.alerts) return [];
+      const rows = this.alerts.filter(a => (this.alertTab === 'all' || !a.read) && (this.alertChannel === '전체' || a.channel === this.alertChannel));
+      const groups = [];
+      for (const a of rows) {
+        const label = a.date === this.boot.today ? '오늘' : a.date === this.yesterday() ? '어제' : this.koDate(a.date);
+        let g = groups.find(x => x.label === label); if (!g) { g = { label, items: [] }; groups.push(g); }
+        g.items.push(a);
+      }
+      return groups;
+    },
+    yesterday() { const d = new Date(this.boot.today + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() - 1); return d.toISOString().slice(0, 10); },
+    koDate(key) { if (!key) return ''; const d = new Date(key + 'T00:00:00Z'); return (d.getUTCMonth() + 1) + '월 ' + d.getUTCDate() + '일(' + '일월화수목금토'[d.getUTCDay()] + ')'; },
+
+    /* ---------- 고객 목록 ---------- */
+    get customerRows() {
+      if (!this.customers) return [];
+      const q = this.customerQuery.trim();
+      const rows = this.customers.filter(c => (this.customerFilter === '전체' || c.stage === this.customerFilter) &&
+        (!q || c.name.includes(q) || (c.phoneLast4 || '').includes(q) || (c.wedding || '').includes(q)));
+      return this.customerSort === 'wedding' ? sortByWedding(rows) : rows;
+    },
+    stageCount(s) { return !this.customers ? 0 : (s === '전체' ? this.customers.length : this.customers.filter(c => c.stage === s).length); },
+
+    /* ---------- 고객 사이클 ---------- */
+    async revealPhone() { try { this.phoneFull = await call('apiRevealPhone', this.customer.card.id); } catch (e) { this.showToast(e.message); } },
+    async firstContact(id, after) {
+      try { await call('apiFirstContact', id); this.showToast('첫 연락 완료로 기록했습니다'); if (after) after(); }
+      catch (e) { this.showToast('저장하지 못했습니다. ' + e.message); }
+    },
+    async togglePayment(p) {
+      if (p.paid && !confirm(p.kind + ' 입금 확인을 되돌릴까요?')) return;
+      const was = { paid: p.paid, date: p.paidDate };
+      this.optimistic(() => { p.paid = !was.paid; p.paidDate = p.paid ? this.boot.today : ''; }, () => { p.paid = was.paid; p.paidDate = was.date; },
+        () => call('apiSetPayment', this.customer.card.id, p.kind, !was.paid), p.paid ? '입금 확인' : '되돌렸습니다');
+    },
+    async loadPhotos(id) { try { this.photos = await call('apiPhotos', id); } catch (e) { this.photos = { photos: [], folderUrl: '' }; } },
+    async uploadPhotos(ev) {
+      const id = this.customer.card.id;
+      const files = Array.from(ev.target.files || []).filter(f => f.type.startsWith('image/'));
+      ev.target.value = '';
+      let ok = 0;
+      for (const f of files) {
+        this.uploading++;
+        try { this.photos = await call('apiUploadPhoto', id, f.name.replace(/\.\w+$/, '') + '.jpg', await shrinkImage(f)); ok++; }
+        catch (e) { this.showToast('사진을 올리지 못했습니다. ' + e.message); }
+        finally { this.uploading--; }
+      }
+      if (ok) this.showToast('사진 ' + ok + '장을 올렸습니다');
+    },
+    async regenerateBriefing() {
+      if (this.briefingBusy) return;
+      if (this.customer.briefing.draft && !confirm('지금 초안을 새 초안으로 바꿀까요?')) return;
+      this.briefingBusy = true;
+      try { this.customer.briefing = await call('apiRegenerateBriefing', this.customer.card.id); this.showToast('새 초안으로 바꿨습니다'); }
+      catch (e) { this.showToast(e.message); }
+      finally { this.briefingBusy = false; }
+    },
+    deleteConsult(c) {
+      if (!confirm('이 상담 기록을 지울까요? 이 기록에서 만든 요청사항은 남습니다.')) return;
+      const list = this.customer.consults; const i = list.indexOf(c);
+      this.optimistic(() => list.splice(i, 1), () => list.splice(i, 0, c), () => call('apiDeleteConsult', c.id), '삭제했습니다');
+    },
+
+    /* ---------- 요청사항 ---------- */
+    startRequest(r) { this.reqEdit = r ? { id: r.id, part: r.part, content: r.content, photo: r.photo, error: '' } : { id: '', part: '', content: '', photo: '', error: '' }; },
+    async saveRequestEdit() {
+      const r = this.reqEdit;
+      if (!r.part || !r.content.trim()) { r.error = '파트와 내용을 채워 주세요'; return; }
+      if (r.content.trim().length > 80) { r.error = '한 줄(80자) 이내로 적어 주세요'; return; }
+      try {
+        await call('apiSaveRequest', { id: r.id, customerId: this.customer.card.id, part: r.part, content: r.content, photo: r.photo });
+        this.reqEdit = null; this.customer = await call('apiCustomer', this.customer.card.id); this.showToast('저장했습니다');
+      } catch (e) { r.error = e.message; }
+    },
+    async deleteRequest(r) {
+      if (!confirm('이 요청사항을 지울까요?')) return;
+      const list = this.customer.requests; const i = list.indexOf(r);
+      this.optimistic(() => list.splice(i, 1), () => list.splice(i, 0, r), () => call('apiDeleteRequest', r.id), '삭제했습니다');
+    },
+    toggleConfirm(r) {
+      const was = r.confirmedAt;
+      this.optimistic(() => { r.confirmedAt = was ? '' : this.boot.today; }, () => { r.confirmedAt = was; }, () => call('apiConfirmRequest', r.id, !was));
+    },
+
+    /* ---------- 상담 기록 추가·수정 ---------- */
+    async openConsult(customerId, existing) {
+      this.consultOpen = true;
+      const draft = storageGet(DRAFT_KEY);
+      if (existing) this.consult = Object.assign(emptyConsult(customerId), { id: existing.id, date: existing.date, method: existing.method, summary: existing.summary });
+      else if (draft && (!customerId || draft.customerId === customerId) && (draft.summary || draft.requests.length)) { this.consult = Object.assign(emptyConsult(), draft, { errors: {} }); this.showToast('작성 중이던 내용을 불러왔습니다'); }
+      else this.consult = emptyConsult(customerId);
+      if (!this.consultTargets.length) { try { this.consultTargets = await call('apiConsultTargets'); } catch (e) { this.showToast(e.message); } }
+    },
+    closeConsult() {
+      this.consultOpen = false;
+      if (this.route.name === 'consult') history.length > 1 ? history.back() : this.go('today');
+    },
+    get consultTargetLabel() { const t = this.consultTargets.find(x => x.id === this.consult.customerId); return t ? t.name + ' · ' + (t.type || '') + (t.date ? ' · ' + t.date : '') : ''; },
+    get consultTargetList() { const q = this.consultQuery.trim(); return this.consultTargets.filter(t => !q || t.name.includes(q)).slice(0, 8); },
+    clearDraft() { if (confirm('임시저장한 내용을 지울까요?')) { storageDel(DRAFT_KEY); this.consult = emptyConsult(this.consult.customerId); } },
+    addConsultRequest() { this.consult.requests.push({ part: '', content: '' }); },
+    async saveConsult() {
+      const c = this.consult; const errors = {};
+      if (!c.customerId) errors.customerId = '고객을 골라 주세요';
+      if (!c.date) errors.date = '상담일을 넣어 주세요';
+      if (!c.method) errors.method = '상담 방식을 골라 주세요';
+      if (!c.summary.trim()) errors.summary = '내용 요약을 적어 주세요';
+      c.requests.forEach((r, i) => { if (r.content.trim() && (!r.part || r.content.trim().length > 80)) errors['req' + i] = !r.part ? '파트를 골라 주세요' : '한 줄(80자) 이내로 적어 주세요'; });
+      c.errors = errors;
+      if (Object.keys(errors).length) return;
+      this.consultSaving = true;
+      try {
+        const savedId = await call('apiSaveConsult', { id: c.id, customerId: c.customerId, date: c.date, method: c.method, summary: c.summary, requests: c.requests });
+        storageDel(DRAFT_KEY);
+        this.showToast('저장했습니다');
+        const target = c.customerId;
+        this.consultOpen = false;
+        if (!c.id) this.loadSuggestions(target, savedId);
+        if (this.route.name === 'customer' && this.route.id === target) this.customer = await call('apiCustomer', target);
+        else if (this.route.name === 'consult') this.mobile ? this.go('today') : this.go('customer', target);
+      } catch (e) { this.showToast('저장하지 못했습니다. ' + e.message, () => this.saveConsult()); }
+      finally { this.consultSaving = false; }
+    },
+
+    /* ---------- Gemini 요청사항 후보 (F6.8, F7.6) ---------- */
+    async loadSuggestions(customerId, consultId) {
+      this.suggest = { customerId, consultId, loading: true, error: '', items: [] };
+      const s = this.suggest;
+      try { s.items = (await call('apiSuggestRequests', consultId)).map(x => Object.assign(x, { state: '' })); }
+      catch (e) { s.error = e.message; }
+      s.loading = false;
+    },
+    async adoptSuggestion(item) {
+      const s = this.suggest; item.state = 'saving';
+      try {
+        await call('apiSaveRequest', { customerId: s.customerId, part: item.part, content: item.content, sourceId: s.consultId });
+        item.state = 'adopted';
+        if (this.route.name === 'customer' && this.route.id === s.customerId) this.customer = await call('apiCustomer', s.customerId);
+      } catch (e) { item.state = ''; this.showToast('저장하지 못했습니다. ' + e.message); }
+    },
+    get suggestPending() { return this.suggest ? this.suggest.items.filter(x => !x.state || x.state === 'saving').length : 0; },
+
+    /* ---------- 오늘 ---------- */
+    openSheet(card) { this.sheet = card; },
+    openSheetCustomer() { const id = this.sheet.id; this.sheet = null; this.go('customer', id); },
+    async sheetFirstContact() {
+      const id = this.sheet.id;
+      await this.firstContact(id, async () => { this.sheet = null; this.today = await call('apiToday'); });
+    },
+
+    /* ---------- 예식 당일 체크 ---------- */
+    async loadDayOf(id) {
+      this.dayof = await call('apiDayOf', id || '');
+      this.dayThumbs = {};
+      if (this.dayof.selected) {
+        try { const p = await call('apiPhotos', this.dayof.selected.id); p.photos.forEach(x => { this.dayThumbs[x.id] = x.thumb; }); this.dayPhotoList = p.photos; } catch (e) { this.dayPhotoList = []; }
+      }
+    },
+    get dayRequests() { return !this.dayof ? [] : this.dayof.requests.filter(r => this.dayPart === '전체' || r.part === this.dayPart); },
+    get dayProgress() { const all = this.dayof ? this.dayof.requests : []; const d = all.filter(r => r.status !== '대기').length; return { d, n: all.length, pct: all.length ? Math.round(d * 100 / all.length) : 0 }; },
+    partRemain(part) { return !this.dayof ? 0 : this.dayof.requests.filter(r => (part === '전체' || r.part === part) && r.status === '대기').length; },
+    async toggleCheck(r) {
+      const was = { status: r.status, checker: r.checker, checkedAt: r.checkedAt };
+      const checked = r.status !== '확인';
+      const now = new Date(); const hhmm = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
+      this.optimistic(
+        () => { r.status = checked ? '확인' : '대기'; r.checker = checked ? this.boot.name : ''; r.checkedAt = checked ? hhmm : ''; },
+        () => Object.assign(r, was),
+        async () => Object.assign(r, await call('apiCheckRequest', this.dayof.selected.id, r.id, checked)));
+    },
+    startMiss(r) { this.missFor = r.id; this.missReason = ''; },
+    async saveMiss(r) {
+      if (!this.missReason.trim()) { this.showToast('빠진 사유를 적어 주세요'); return; }
+      try { Object.assign(r, await call('apiMissRequest', this.dayof.selected.id, r.id, this.missReason)); this.missFor = ''; this.showToast('회고 항목에 남겼습니다'); }
+      catch (e) { this.showToast('저장하지 못했습니다. ' + e.message); }
+    },
+
+    /* ---------- 사진 보기 ---------- */
+    async openViewer(customerId, list, index) {
+      this.viewer = { customerId, list, index, src: '', loading: true };
+      this.loadViewer();
+    },
+    async loadViewer() {
+      const v = this.viewer; if (!v) return;
+      v.loading = true; v.src = v.list[v.index].thumb || '';
+      try { v.src = await call('apiPhoto', v.customerId, v.list[v.index].id); } catch (e) { this.showToast('사진을 열 수 없습니다'); }
+      v.loading = false;
+    },
+    stepViewer(d) { const v = this.viewer; v.index = (v.index + d + v.list.length) % v.list.length; this.loadViewer(); },
+    openRequestPhoto(r, customerId) {
+      const list = (this.dayPhotoList || (this.photos && this.photos.photos) || []);
+      const i = list.findIndex(p => p.id === r.photoId);
+      if (i >= 0) this.openViewer(customerId, list, i);
+      else if (r.photo) window.open(r.photo, '_blank');
+    },
+  };
+}
+</script>
